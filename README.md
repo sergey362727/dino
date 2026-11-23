@@ -5,6 +5,7 @@
 - `dino.py` — DQN-агент на Python (numpy + Playwright);
 - `index.js` — локальная копия исходного кода игры, которой подменяется сетевой скрипт;
 - `dqn_model.npz` — веса обученной модели;
+- `CODE_DESCRIPTION.md` — подробное описание архитектуры, алгоритмов и кода для защиты;
 - `requirements.txt`, `setup.sh`, `play.sh`, `train.sh`, `auto.sh` — зависимости и скрипты для Linux/macOS;
 - `play.bat`, `train.bat`, `auto.bat` — скрипты для Windows.
 
