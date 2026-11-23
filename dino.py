@@ -1,18 +1,76 @@
 """
-DQN-агент для https://wayou.github.io/t-rex-runner/
+DQN-агент для T-Rex Runner (https://wayou.github.io/t-rex-runner/).
 
-Игра запускается через Playwright. Локальный index.js (из этой же папки)
-подменяет сетевой скрипт игры, а игровой цикл переводится в пошаговый режим:
-Python выбирает действие -> JS делает ровно один кадр -> Python получает
-новое состояние. Это позволяет обучаться в сотни раз быстрее реального времени,
-а затем запустить игру "бесконечно" в обычном темпе.
+===============================================================================
+НАЗНАЧЕНИЕ
+===============================================================================
+Файл содержит полный агент, который обучается играть в оригинальную игру и
+затем запускает её «бесконечно». Логика разделена на четыре слоя:
 
-Режимы:
-    python dino.py train   - только обучение
-    python dino.py play    - только бесконечная игра по обученной модели
-    python dino.py auto    - обучение, затем бесконечная игра (по умолчанию)
+1. Браузерный слой (open_browser, INIT_SCRIPT, BRIDGE_SCRIPT):
+   Playwright открывает страницу игры, но сетевой `index.js` подменяется
+   локальной копией из этой же папки. Движок игры НЕ изменяется — агент только
+   управляет им через JavaScript-мост `window.__dino`.
 
-Зависимости: numpy, playwright (уже установлены). torch/tensorflow не нужны.
+2. Слой окружения (DinoEnv, encode_state, compute_reward):
+   собственный requestAnimationFrame игры отключается. Один вызов
+   `window.__dino.step(action)` выполняет ровно один кадр. Python получает
+   снимок состояния, строит вектор признаков и награду.
+
+3. Слой обучения (DQN, ReplayBuffer, expert_action, train):
+   DQN на чистом numpy: MLP 147 -> 256 -> 256 -> 3, experience replay,
+   target network, Huber loss и Adam. Сначала сеть клонирует надёжную
+   эвристику-учителя (imitation warm start), затем при необходимости
+   дообучается через Q-learning.
+
+4. Слой воспроизведения (play_forever):
+   загружается `dqn_model.npz`, на каждом кадре выбирается действие с
+   максимальным Q-значением. Игра выдерживает 60 кадров/с и продолжается
+   до нажатия Ctrl+C; после столкновения вызывается reset.
+
+===============================================================================
+ПРОСТРАНСТВО СОСТОЯНИЙ И ДЕЙСТВИЙ
+===============================================================================
+Состояние — стек из 3 кадров по 49 признаков (итого 147):
+  * 5 признаков динозавра: высота над землёй, вертикальная скорость,
+    флаги прыжка/приседания, текущая скорость;
+  * 4 блока по 9 признаков: три ближайших препятствия + «блокер» — первое
+    ещё не пройденное препятствие (тип, расстояние до него, время до встречи,
+    ширина, координата Y, высота, скорость птеродактиля);
+  * 8 явных признаков эвристики (нужно ли приседать, окно прыжка и т.д.),
+    которые упрощают клонирование и убирают ошибки на границах порогов.
+
+Действия:
+  0 — ничего не делать;
+  1 — прыжок;
+  2 — приседание на земле / ускоренное падение в воздухе.
+
+Награда: небольшие штрафы за действия + бонус за пройденную дистанцию,
+штраф за столкновение и формирующие бонусы за правильную позу относительно
+ближайшего препятствия.
+
+===============================================================================
+РЕЖИМЫ ЗАПУСКА
+===============================================================================
+    python dino.py train              - обучение
+    python dino.py train --fresh      - обучение с нуля
+    python dino.py play               - бесконечная игра по обученной модели
+    python dino.py auto               - по умолчанию: обучение, затем игра
+    python dino.py play --speed 5     - ускоренное отображение
+    python dino.py play --speed 0     - максимально быстро, без задержек
+
+На Linux/macOS используются `./train.sh`, `./play.sh`, `./auto.sh`.
+Если графического окружения нет, игра автоматически идёт в headless-режиме.
+
+===============================================================================
+ВАЖНО
+===============================================================================
+`index.js` — это исходный файл игры, он не редактировался и должен оставаться
+неизменным (SHA-256 совпадает с файлом из Downloads). Все правки находятся
+только в этом файле. Настройки игры (`SPEED`, `GRAVITY`, `CLEAR_TIME` и т.д.)
+берутся из `index.js` без переопределений.
+
+Зависимости: numpy, playwright. torch/tensorflow не нужны.
 """
 
 from __future__ import annotations
@@ -94,6 +152,12 @@ BRIDGE_SCRIPT = r"""
   const r = R && R.instance_;
   if (!r) return { ok: false, error: 'Runner.instance_ не найден' };
 
+  // Что делает этот мост:
+  //  * останавливает собственный цикл requestAnimationFrame игры;
+  //  * включает тот же arcade-режим, что и после нажатия Space на сайте;
+  //  * возвращает state пересчёта размеров окна, чтобы игра не ставилась на паузу;
+  //  * snapshot() собирает признаки для нейросети, не меняя файл index.js;
+  //  * step(action) выполняет ровно один кадр с текущим действием агента.
   if (r.raqId) {
     cancelAnimationFrame(r.raqId);
     r.raqId = 0;
@@ -268,6 +332,14 @@ BRIDGE_SCRIPT = r"""
 # ---------------------------------------------------------------------------
 
 class DQN:
+    """Полносвязная DQN-сеть на numpy без внешних ML-фреймворков.
+
+    Архитектура: state_dim -> 256 -> 256 -> n_actions.
+    Веса инициализируются по He ( под ReLU ), оптимизатор — Adam с
+    отсечкой градиента по норме (gradient clipping). Поддерживаются два
+    режима обучения: клонирование эвристики и обычный Q-learning.
+    """
+
     def __init__(self, state_dim: int, n_actions: int = N_ACTIONS,
                  lr: float = LEARNING_RATE, seed: int = SEED):
         rng = np.random.default_rng(seed)
@@ -297,6 +369,11 @@ class DQN:
 
     @staticmethod
     def _forward(x, params):
+        """Прямой проход: возвращает Q-значения и кэш для backprop.
+
+        После каждого линейного слоя используется ReLU, кроме последнего —
+        его выход есть вектор Q-значений для всех действий.
+        """
         h = x
         caches = []
         last = len(params) // 2 - 1
@@ -307,19 +384,27 @@ class DQN:
         return h, caches
 
     def q_values(self, state: np.ndarray) -> np.ndarray:
+        """Q-значения для одного состояния (используется в жадной политике play)."""
         x = np.asarray(state, dtype=np.float32).reshape(1, -1)
         return self._forward(x, self.params)[0][0]
 
     def act(self, state: np.ndarray, epsilon: float,
             rng: np.random.Generator) -> int:
+        """epsilon-greedy выбор действия во время обучения."""
         if rng.random() < epsilon:
             return int(rng.integers(self.n_actions))
         return int(np.argmax(self.q_values(state)))
 
     def sync_target(self):
+        """Скопировать веса online-сети в target-сеть.
+
+        Target-сеть даёт стабильные цели в формуле Беллмана и обновляется
+        раз в TARGET_SYNC_EVERY шагов, а не на каждом мини-батче.
+        """
         self.target_params = self._clone(self.params)
 
     def _adam_step(self, grads):
+        """Один шаг Adam с глобальной отсечкой градиента по норме."""
         norm = math.sqrt(sum(float(np.sum(g * g)) for g in grads.values()))
         scale = 1.0 if norm <= 5.0 else 5.0 / max(norm, 1e-9)
 
@@ -334,7 +419,13 @@ class DQN:
             self.params[k] += (-self.lr * mhat / (np.sqrt(vhat) + self._eps)).astype(np.float32)
 
     def imitate_batch(self, states, actions):
-        """Тёплый старт: клонируем действия эвристики через softmax-кросс-энтропию."""
+        """Тёплый старт: клонируем действия эвристики-учителя.
+
+        На выходе сети считается softmax по Q-значениям, затем минимизируется
+        кросс-энтропия с меткой `expert_action()`. Это оказалось надёжнее, чем
+        чистый DQN с нуля: сеть быстро получает корректную политику, а редкие
+        ошибки на границах порогов убираются явными признаками в encode_state().
+        """
         q, caches = self._forward(states, self.params)
         q = q - q.max(axis=1, keepdims=True)
         exp_q = np.exp(q)
@@ -355,6 +446,12 @@ class DQN:
         return float(np.mean(np.abs(dq)))
 
     def train_batch(self, states, actions, rewards, next_states, terminals):
+        """Одно обновление DQN по мини-батчу из replay-буфера.
+
+        Цель Беллмана: r + GAMMA * max_a Q_target(s', a), но для терминальных
+        состояний бутстрепинг отключается. Ошибка между предсказанным Q и
+        целью сжимается через Huber loss (отсечка градиента на ±1).
+        """
         q, caches = self._forward(states, self.params)
         q_next = self._forward(next_states, self.target_params)[0]
 
@@ -385,6 +482,7 @@ class DQN:
         return float(np.mean(np.abs(diff)))
 
     def save(self, path: Path = MODEL_FILE):
+        """Сохранить online- и target-веса в сжатый `.npz`."""
         data = {"state_dim": np.array(self.sizes[0])}
         for k, v in self.params.items():
             data[f"online_{k}"] = v
@@ -395,6 +493,7 @@ class DQN:
 
     @classmethod
     def load(cls, path: Path = MODEL_FILE):
+        """Загрузить модель; при битом/старом файле вернуть None."""
         if not path.exists():
             return None
         try:
@@ -416,6 +515,13 @@ class DQN:
 
 
 class ReplayBuffer:
+    """Кольцевой буфер опыта для обучения с подкреплением.
+
+    Хранит переходы (s, a, r, s', terminal) и позволяет брать случайный
+    мини-батч без повторов. Это разрушает корреляцию между соседними
+    кадрами игры и стабилизирует обучение.
+    """
+
     def __init__(self, capacity: int, state_dim: int, seed: int = SEED):
         self.capacity = capacity
         self.size = 0
@@ -428,6 +534,7 @@ class ReplayBuffer:
         self.terminals = np.zeros(capacity, dtype=np.float32)
 
     def add(self, state, action, reward, next_state, terminal):
+        """Добавить один переход, перезаписав самый старый при переполнении."""
         i = self.pos
         self.states[i] = state
         self.actions[i] = action
@@ -438,6 +545,7 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int):
+        """Вернуть случайный мини-батч переходов без повторных индексов."""
         idx = self.rng.choice(self.size, size=batch_size, replace=False)
         return (self.states[idx], self.actions[idx], self.rewards[idx],
                 self.next_states[idx], self.terminals[idx])
@@ -452,7 +560,17 @@ def _clip(x, lo=-2.0, hi=2.0):
 
 
 def encode_state(snap: dict) -> np.ndarray:
-    """Один кадр -> вектор признаков для сети."""
+    """Один снимок игры -> нормализованный вектор из 49 признаков.
+
+    Признаки делятся на три группы:
+      1) состояние динозавра (высота, скорость прыжка, флаги, общая скорость);
+      2) четыре описания препятствий: три «сырых» + текущий блокер;
+      3) явные признаки эвристики, которые делают клонирование почти линейной
+         задачей и снижают число ошибок на границах порогов (45/95/105/180 px).
+
+    Значения обрезаются `_clip()`, чтобы большие координаты не доминировали
+    в обновлениях весов. Три таких вектора склеиваются в состояние 147 чисел.
+    """
     d = snap["dino"]
     parts = [
         _clip(d["heightAbove"] / 60.0, -0.2, 1.5),
@@ -498,6 +616,13 @@ def encode_state(snap: dict) -> np.ndarray:
 
 
 def compute_reward(prev: dict, cur: dict, action: int) -> float:
+    """Награда за один кадр: дистанция, штрафы за действия и формаующие бонусы.
+
+    `terminal`-награда (-15) выставляется только при реальном столкновении.
+    Формирующие бонусы поощряют правильную позу заранее: прыжок над кактусом
+    или приседание под высоким птеродактилем. Это ускоряет сходимость, но
+    итоговая политика в `play` всё равно выбирается только по Q-значениям.
+    """
     if cur["dead"]:
         return -15.0
 
@@ -535,7 +660,18 @@ def compute_reward(prev: dict, cur: dict, action: int) -> float:
 
 
 def expert_action(snap: dict, rng: np.random.Generator | None = None) -> int:
-    """Простая эвристика для тёплого старта DQN (не используется в play)."""
+    """Детерминированная эвристика-учитель для imitation learning.
+
+    Правила основаны на геометрии исходной игры:
+      * высокий птеродактиль (Y=50/75) — приседать при dx < 105;
+      * кактус/низкий птеродактиль — прыгать в окне 45 < dx < 95;
+      * если препятствие, под которым мы прыгали, уже позади (dx > 180),
+        можно ускорить приземление через действие 2.
+
+    Параметр `rng` оставлен для совместимости, но шум намеренно не
+    добавляется: он портил бы метки для клонирования. В `play` эвристика
+    не вызывается — там работает только нейросеть.
+    """
     # Эвристика детерминированная: случайный шум портил бы метки для клонирования.
     o = snap["blocker"]
     d = snap["dino"]
@@ -562,12 +698,20 @@ def expert_action(snap: dict, rng: np.random.Generator | None = None) -> int:
 
 
 class DinoEnv:
+    """Обёртка над JS-мостом: превращает игру в пошаговое окружение Gym-стиля.
+
+    Каждый вызов `step(action)` выполняет ровно один кадр движка, а не
+    зависит от requestAnimationFrame. Это позволяет и быстро обучаться (без
+    задержек реального времени), и показывать игру в ровном темпе 60 FPS.
+    """
+
     def __init__(self, page):
         self.page = page
         self.frames = deque(maxlen=FRAME_STACK)
         self.prev = None
 
     def reset(self):
+        """Начать новый эпизод: сбросить игру и заполнить стек кадров одним снимком."""
         snap = self.page.evaluate("() => window.__dino.reset()")
         self.prev = snap
         frame = encode_state(snap)
@@ -577,9 +721,11 @@ class DinoEnv:
         return self._state(), snap
 
     def _state(self):
+        """Склеить последние FRAME_STACK кадров в один вектор состояния."""
         return np.concatenate(list(self.frames)).astype(np.float32)
 
     def step(self, action: int):
+        """Применить действие, сдвинуть игровой кадр и вернуть (s, r, dead, snap)."""
         snap = self.page.evaluate("(a) => window.__dino.step(a)", action)
         reward = compute_reward(self.prev, snap, action)
         self.prev = snap
@@ -592,6 +738,20 @@ class DinoEnv:
 # ---------------------------------------------------------------------------
 
 def open_browser(headless: bool):
+    """Открыть игру в Chromium/Chrome и установить JS-мост.
+
+    Последовательность:
+      1) подменить сетевой `index.js` локальным файлом через `page.route()`;
+      2) ввести псевдо-часы (переопределён `performance.now()`), чтобы шагать
+         по кадрам вручную;
+      3) дождаться `Runner.instance_`, отключить его планировщик и применить
+         BRIDGE_SCRIPT;
+      4) вернуть (playwright, browser, page).
+
+    Для обучения используется headless + фиксированный viewport. Для игры —
+    видимое окно без искусственного viewport; если графики нет, вызывающий
+    код сам передаёт `headless=True`.
+    """
     if not LOCAL_JS.exists():
         raise FileNotFoundError(f"Не найден {LOCAL_JS}. Положите index.js рядом с dino.py")
 
@@ -643,6 +803,17 @@ def open_browser(headless: bool):
 # ---------------------------------------------------------------------------
 
 def train(page, steps: int = TRAIN_STEPS, load_existing: bool = True):
+    """Обучить агента и сохранить модель в `dqn_model.npz`.
+
+    Две фазы:
+      1) `step <= EXPERT_STEPS`: действия берутся из `expert_action()`,
+         а сеть обучается клонировать их через `imitate_batch()`;
+      2) после этого включается обычный DQN: epsilon-greedy исследование,
+         target-сеть и Q-learning по мини-батчам из replay-буфера.
+
+    Episodes принудительно обрываются через MAX_EPISODE_STEPS — это нужно
+    только для обновления буфера/статистики; настоящий terminal — столкновение.
+    """
     random.seed(SEED)
     np.random.seed(SEED)
     rng = np.random.default_rng(SEED)
@@ -725,6 +896,15 @@ def train(page, steps: int = TRAIN_STEPS, load_existing: bool = True):
 # ---------------------------------------------------------------------------
 
 def play_forever(page, speed: float = PLAY_SPEED):
+    """Бесконечно играть жадной политикой обученной DQN-модели.
+
+    Особенности:
+      * действие выбирается как argmax Q-значений, исследование/epsilon не используется;
+      * в первые 3 секунды (штатный CLEAR_TIME) препятствий нет — агент
+        принудительно держит действие 0, чтобы не дёргаться;
+      * выдерживается ровно 60 кадров/с с учётом времени самого шага;
+      * после столкновения вызывается reset и счётчик жизней увеличивается.
+    """
     env = DinoEnv(page)
     first = page.evaluate("() => window.__dino.reset()")
     state_dim = len(encode_state(first)) * FRAME_STACK
@@ -789,6 +969,7 @@ def can_show_window() -> bool:
 
 
 def main():
+    """Разбор аргументов командной строки и запуск выбранного режима."""
     parser = argparse.ArgumentParser(description="DQN для T-Rex Runner")
     parser.add_argument("mode", nargs="?", default="auto",
                         choices=["train", "play", "auto"],
